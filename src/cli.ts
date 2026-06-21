@@ -48,7 +48,13 @@ function shouldStopAtFirstOldResult(searchUrl: string): boolean {
 function printHelp(): void {
   console.log(`
 Usage:
+  npm run crawl -- "정수기 렌탈" 2025-01-01 120
+  npm run crawl -- "인터넷 설치" 50
   npm run crawl -- [options]
+
+Positional shortcut:
+  "키워드" "수집 종료 날짜(YYYY-MM-DD)" "최대 글 수"
+  "키워드" "최대 글 수"  # 날짜 제한 없이 최신순 N건
 
 Options:
   --site=fmkorea,clien,arca,dcinside  Crawl only selected sites
@@ -62,6 +68,10 @@ Options:
   --delay-ms=1200                     Delay between page/detail requests
   --max-pages=200                     Max search pages per query
   --pages=3                           Alias for --max-pages
+  --max-posts=100                     Max saved posts across all selected sites
+  --limit=100                         Alias for --max-posts
+  --max-posts-per-site=30             Max collected posts per site
+  --site-limit=30                     Alias for --max-posts-per-site
   --query-label="정수기 렌탈"         Use a one-off query label instead of config
   --query-url="https://..."           Use a one-off search URL instead of config
   --headed                            Open Chrome visibly (recommended for challenge pages)
@@ -102,9 +112,103 @@ function normalizeSort(value: string | undefined): SearchSort {
   throw new Error(`Unsupported sort: ${value}`);
 }
 
-function parseArgs(argv: string[]): CliOptions {
+function parsePositiveIntegerOption(
+  value: string | undefined,
+  optionName: string,
+): number {
+  const raw = String(value || "").trim();
+  const parsed = Number.parseInt(raw, 10);
+
+  if (!raw || !Number.isFinite(parsed) || parsed < 1) {
+    throw new Error(`${optionName} must be a positive number.`);
+  }
+
+  return parsed;
+}
+
+function isDateLike(value: string | undefined): boolean {
+  return /^\d{4}-\d{2}-\d{2}$/.test(String(value || "").trim());
+}
+
+function isPositiveIntegerString(value: string | undefined): boolean {
+  return /^[1-9]\d*$/.test(String(value || "").trim());
+}
+
+function sanitizeFilenamePart(value: string): string {
+  const sanitized = value.replace(/[^\p{L}\p{N}-]+/gu, "");
+  return sanitized || "keyword";
+}
+
+function buildShortcutOutputPath(options: CliOptions): string {
+  const keyword = options.keywords[0] || "keyword";
+  const dateLabel = options.noCutoff ? "최신" : `${options.cutoffDate}까지`;
+  const countLabel = options.maxPosts ? `${options.maxPosts}건` : "전체";
+
+  return path.resolve(
+    process.cwd(),
+    "output",
+    `${sanitizeFilenamePart(keyword)}_${dateLabel}_${countLabel}.csv`,
+  );
+}
+
+function applyPositionalShortcut(
+  positionalArgs: string[],
+  options: CliOptions,
+  outputWasProvided: boolean,
+): void {
+  if (!positionalArgs.length) {
+    return;
+  }
+
+  if (positionalArgs.length > 3) {
+    throw new Error(
+      "Too many positional arguments. Use: npm run crawl -- \"키워드\" 2025-01-01 100",
+    );
+  }
+
+  if (options.keywords.length || options.queryLabel || options.queryUrl) {
+    throw new Error(
+      "Positional shortcut cannot be used with --keyword/--keywords or --query-url.",
+    );
+  }
+
+  const [keyword, dateOrCount, count] = positionalArgs;
+  options.keywords = [keyword];
+
+  if (dateOrCount) {
+    if (isDateLike(dateOrCount)) {
+      options.cutoffDate = dateOrCount;
+      options.noCutoff = false;
+    } else if (isPositiveIntegerString(dateOrCount)) {
+      options.maxPosts = parsePositiveIntegerOption(dateOrCount, "positional max posts");
+      options.noCutoff = true;
+    } else {
+      throw new Error(
+        "Second positional argument must be a date like 2025-01-01 or a max post count like 100.",
+      );
+    }
+  }
+
+  if (count) {
+    if (!isDateLike(dateOrCount)) {
+      throw new Error(
+        "Third positional argument is only allowed after a date. Use: \"키워드\" 2025-01-01 100",
+      );
+    }
+
+    options.maxPosts = parsePositiveIntegerOption(count, "positional max posts");
+  }
+
+  if (!outputWasProvided) {
+    options.output = buildShortcutOutputPath(options);
+  }
+}
+
+export function parseArgs(argv: string[]): CliOptions {
   const args = argv.slice(2);
   const configuredSites = Object.keys(siteRegistry) as SiteId[];
+  const positionalArgs: string[] = [];
+  let outputWasProvided = false;
 
   const options: CliOptions = {
     cutoffDate: "2025-01-01",
@@ -167,6 +271,7 @@ function parseArgs(argv: string[]): CliOptions {
     if (arg.startsWith("--output")) {
       const { value, consumed } = readArgValue(args, index);
       options.output = path.resolve(process.cwd(), value || options.output);
+      outputWasProvided = true;
       index += consumed;
       continue;
     }
@@ -181,6 +286,23 @@ function parseArgs(argv: string[]): CliOptions {
     if (arg.startsWith("--max-pages") || arg.startsWith("--pages")) {
       const { value, consumed } = readArgValue(args, index);
       options.maxPages = Number.parseInt(value || String(options.maxPages), 10);
+      index += consumed;
+      continue;
+    }
+
+    if (arg.startsWith("--max-posts-per-site") || arg.startsWith("--site-limit")) {
+      const { value, consumed } = readArgValue(args, index);
+      options.maxPostsPerSite = parsePositiveIntegerOption(
+        value,
+        "--max-posts-per-site/--site-limit",
+      );
+      index += consumed;
+      continue;
+    }
+
+    if (arg.startsWith("--max-posts") || arg.startsWith("--limit")) {
+      const { value, consumed } = readArgValue(args, index);
+      options.maxPosts = parsePositiveIntegerOption(value, "--max-posts/--limit");
       index += consumed;
       continue;
     }
@@ -224,8 +346,16 @@ function parseArgs(argv: string[]): CliOptions {
       continue;
     }
 
+    if (!arg.startsWith("--")) {
+      positionalArgs.push(arg);
+      index += 1;
+      continue;
+    }
+
     throw new Error(`Unknown argument: ${arg}`);
   }
+
+  applyPositionalShortcut(positionalArgs, options, outputWasProvided);
 
   if ((options.queryLabel && !options.queryUrl) || (!options.queryLabel && options.queryUrl)) {
     throw new Error("--query-label and --query-url must be used together.");
@@ -249,6 +379,20 @@ function parseArgs(argv: string[]): CliOptions {
 
   if (!Number.isFinite(options.delayMs) || options.delayMs < 0) {
     throw new Error("--delay-ms must be zero or a positive number.");
+  }
+
+  if (
+    options.maxPosts !== undefined &&
+    (!Number.isFinite(options.maxPosts) || options.maxPosts < 1)
+  ) {
+    throw new Error("--max-posts/--limit must be a positive number.");
+  }
+
+  if (
+    options.maxPostsPerSite !== undefined &&
+    (!Number.isFinite(options.maxPostsPerSite) || options.maxPostsPerSite < 1)
+  ) {
+    throw new Error("--max-posts-per-site/--site-limit must be a positive number.");
   }
 
   return options;
@@ -284,6 +428,7 @@ async function collectCandidatesForSite(
   site: SiteAdapter,
   options: CliOptions,
   tools: CrawlerTools,
+  maxCandidates?: number,
 ): Promise<PostCandidate[]> {
   const cutoffDate = options.noCutoff
     ? null
@@ -295,7 +440,9 @@ async function collectCandidatesForSite(
 
   const byKey = new Map<string, PostCandidate>();
   const queries = getQueriesForSite(site, options);
+  let reachedCandidateLimit = false;
 
+  queryLoop:
   for (const query of queries) {
     console.log(`\n[${site.displayName}] collecting search results for "${query.label}"`);
     const stopAtFirstOldResult = shouldStopAtFirstOldResult(query.searchUrl);
@@ -324,6 +471,18 @@ async function collectCandidatesForSite(
         const key = `${site.id}:${item.boardCode || ""}:${item.postId}`;
         const merged = mergeCandidate(byKey.get(key), item);
         byKey.set(key, merged);
+
+        if (maxCandidates !== undefined && byKey.size >= maxCandidates) {
+          reachedCandidateLimit = true;
+          break;
+        }
+      }
+
+      if (reachedCandidateLimit) {
+        console.log(
+          `  - page ${pageNumber}: reached candidate limit ${maxCandidates}, stopping this site`,
+        );
+        break queryLoop;
       }
 
       if (reachedCutoff) {
@@ -430,17 +589,37 @@ async function main(): Promise<void> {
     const allPosts: PostRecord[] = [];
 
     for (const site of selectedSites) {
+      const remainingGlobalPosts =
+        options.maxPosts === undefined ? undefined : options.maxPosts - allPosts.length;
+
+      if (remainingGlobalPosts !== undefined && remainingGlobalPosts <= 0) {
+        console.log(`Reached max posts ${options.maxPosts}, stopping remaining sites`);
+        break;
+      }
+
       const queries = getQueriesForSite(site, options);
       if (!queries.length) {
         console.log(`[${site.displayName}] no configured queries, skipping`);
         continue;
       }
 
-      const candidates = await collectCandidatesForSite(site, options, tools);
+      const siteCandidateLimit = Math.min(
+        options.maxPostsPerSite ?? Number.POSITIVE_INFINITY,
+        remainingGlobalPosts ?? Number.POSITIVE_INFINITY,
+      );
+      const maxCandidates = Number.isFinite(siteCandidateLimit)
+        ? siteCandidateLimit
+        : undefined;
+      const candidates = await collectCandidatesForSite(site, options, tools, maxCandidates);
       console.log(`[${site.displayName}] unique posts after dedupe: ${candidates.length}`);
 
       const posts = await hydrateDetails(site, candidates, options, tools);
       allPosts.push(...posts);
+
+      if (options.maxPosts !== undefined && allPosts.length >= options.maxPosts) {
+        console.log(`Reached max posts ${options.maxPosts}, stopping remaining sites`);
+        break;
+      }
     }
 
     writePostsCsv(allPosts, options.output);
@@ -450,12 +629,14 @@ async function main(): Promise<void> {
   }
 }
 
-void main().catch((error: unknown) => {
-  const errorMessage = getErrorMessage(error);
-  if (error instanceof Error && error.stack) {
-    console.error(error.stack);
-  } else {
-    console.error(errorMessage);
-  }
-  process.exitCode = 1;
-});
+if (require.main === module) {
+  void main().catch((error: unknown) => {
+    const errorMessage = getErrorMessage(error);
+    if (error instanceof Error && error.stack) {
+      console.error(error.stack);
+    } else {
+      console.error(errorMessage);
+    }
+    process.exitCode = 1;
+  });
+}

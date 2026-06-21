@@ -106,6 +106,8 @@ export interface CliOptions {
   delayMs: number;
   output: string;
   maxPages: number;
+  maxPosts?: number;
+  maxPostsPerSite?: number;
   headed: boolean;
   chromePath: string;
   sites: SiteId[];
